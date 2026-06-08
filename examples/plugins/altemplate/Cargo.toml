@@ -1,0 +1,18 @@
+[package]
+name = "suricata-altemplate"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+nom7 = { version="7.0", package="nom" }
+libc = "~0.2.82"
+suricata-sys = { path = "../../../rust/sys" }
+suricata-ffi = { path = "../../../rust/ffi" }
+suricata-derive = { path = "../../../rust/derive" }
+
+[features]
+default = ["suricata8"]
+suricata8 = []

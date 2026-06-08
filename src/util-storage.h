@@ -1,0 +1,70 @@
+/* Copyright (C) 2007-2013 Open Information Security Foundation
+ *
+ * You can copy, redistribute or modify this Program under the terms of
+ * the GNU General Public License version 2 as published by the Free
+ * Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * version 2 along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+ * 02110-1301, USA.
+ */
+
+/**
+ *  \file
+ *
+ *  \author Victor Julien <victor@inliniac.net>
+ *
+ *  Storage API
+ */
+
+#ifndef SURICATA_UTIL_STORAGE_H
+#define SURICATA_UTIL_STORAGE_H
+
+typedef enum StorageEnum_ {
+    STORAGE_HOST,
+    STORAGE_FLOW,
+    STORAGE_IPPAIR,
+    STORAGE_DEVICE,
+    STORAGE_THREAD,
+
+    STORAGE_MAX,
+} StorageEnum;
+
+/** void ptr array for now */
+typedef struct Storage {
+    void *ptr;
+} Storage;
+
+void SCStorageInit(void);
+void SCStorageCleanup(void);
+
+/** \brief Register new storage
+ *
+ *  \param type type from StorageEnum
+ *  \param name name
+ *  \param Free free function for per instance storage
+ */
+int SCStorageRegister(const StorageEnum type, const char *name, void (*Free)(void *));
+int SCStorageFinalize(void);
+
+unsigned int SCStorageGetCnt(const StorageEnum type);
+unsigned int SCStorageGetSize(const StorageEnum type);
+
+/** \brief get storage for id */
+void *SCStorageGetById(const Storage *storage, const StorageEnum type, const int id);
+/** \brief set storage for id */
+int SCStorageSetById(Storage *storage, const StorageEnum type, const int id, void *ptr);
+
+/** \brief AllocById func for prealloc'd base storage (storage ptrs are part
+ *         of another memory block) */
+void *SCStorageAllocByIdPrealloc(Storage *storage, StorageEnum type, int id);
+void SCStorageFreeById(Storage *storage, const StorageEnum type, const int id);
+void SCStorageFreeAll(Storage *storage, const StorageEnum type);
+
+#endif

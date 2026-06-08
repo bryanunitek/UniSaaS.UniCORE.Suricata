@@ -1,0 +1,637 @@
+/* Copyright (C) 2020 Open Information Security Foundation
+ *
+ * You can copy, redistribute or modify this Program under the terms of
+ * the GNU General Public License version 2 as published by the Free
+ * Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * version 2 along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+ * 02110-1301, USA.
+ */
+
+// Author: Frank Honza <frank.honza@dcso.de>
+
+use super::ike::ALPROTO_IKE;
+use super::ipsec_parser::IkeV2Transform;
+use super::parser::AttributeType;
+use crate::core::{STREAM_TOCLIENT, STREAM_TOSERVER};
+use crate::detect::uint::{
+    detect_match_uint, detect_parse_uint, DetectUintData, SCDetectU32Free, SCDetectU32Parse,
+    SCDetectU8Free, SCDetectU8Parse,
+};
+use crate::detect::{
+    helper_keyword_register_multi_buffer, helper_keyword_register_sticky_buffer, EnumString,
+    SigTableElmtStickyBuffer, SIGMATCH_INFO_UINT32, SIGMATCH_INFO_UINT8,
+};
+use crate::ike::ike::*;
+use nom8::bytes::complete::take_while;
+use nom8::combinator::map_opt;
+use nom8::{AsChar, Parser};
+use std::ffi::CStr;
+use std::os::raw::{c_char, c_int, c_void};
+use std::ptr;
+use suricata_sys::sys::{
+    DetectEngineCtx, DetectEngineThreadCtx, SCDetectBufferSetActiveList,
+    SCDetectHelperBufferMpmRegister, SCDetectHelperBufferProgressRegister,
+    SCDetectHelperKeywordRegister, SCDetectHelperMultiBufferMpmRegister,
+    SCDetectSignatureSetAppProto, SCSigMatchAppendSMToList, SCSigTableAppLiteElmt, SigMatchCtx,
+    Signature,
+};
+
+unsafe extern "C" fn ike_get_nonce_data(
+    tx: *const c_void, _flags: u8, buffer: *mut *const u8, buffer_len: *mut u32,
+) -> bool {
+    let tx = cast_pointer!(tx, IKETransaction);
+    if tx.ike_version == 1 && !tx.hdr.ikev1_header.nonce.is_empty() {
+        let p = &tx.hdr.ikev1_header.nonce;
+        *buffer = p.as_ptr();
+        *buffer_len = p.len() as u32;
+        return true;
+    }
+
+    *buffer = ptr::null();
+    *buffer_len = 0;
+    return false;
+}
+
+unsafe extern "C" fn ike_tx_get_key_exchange(
+    tx: *const c_void, _flags: u8, buffer: *mut *const u8, buffer_len: *mut u32,
+) -> bool {
+    let tx = cast_pointer!(tx, IKETransaction);
+    if tx.ike_version == 1 && !tx.hdr.ikev1_header.key_exchange.is_empty() {
+        let p = &tx.hdr.ikev1_header.key_exchange;
+        *buffer = p.as_ptr();
+        *buffer_len = p.len() as u32;
+        return true;
+    }
+
+    *buffer = ptr::null();
+    *buffer_len = 0;
+    return false;
+}
+
+unsafe extern "C" fn ike_tx_get_vendor(
+    _de: *mut DetectEngineThreadCtx, tx: *const c_void, _flags: u8, i: u32, buf: *mut *const u8,
+    len: *mut u32,
+) -> bool {
+    let tx = cast_pointer!(tx, IKETransaction);
+    if tx.ike_version == 1 && i < tx.hdr.ikev1_header.vendor_ids.len() as u32 {
+        *len = tx.hdr.ikev1_header.vendor_ids[i as usize].len() as u32;
+        *buf = tx.hdr.ikev1_header.vendor_ids[i as usize].as_ptr();
+        return true;
+    }
+
+    *buf = ptr::null();
+    *len = 0;
+
+    return false;
+}
+
+unsafe extern "C" fn ike_tx_get_spi_initiator(
+    tx: *const c_void, _flags: u8, buffer: *mut *const u8, buffer_len: *mut u32,
+) -> bool {
+    let tx = cast_pointer!(tx, IKETransaction);
+    *buffer = tx.hdr.spi_initiator.as_ptr();
+    *buffer_len = tx.hdr.spi_initiator.len() as u32;
+    return true;
+}
+
+unsafe extern "C" fn ike_tx_get_spi_responder(
+    tx: *const c_void, _flags: u8, buffer: *mut *const u8, buffer_len: *mut u32,
+) -> bool {
+    let tx = cast_pointer!(tx, IKETransaction);
+    *buffer = tx.hdr.spi_responder.as_ptr();
+    *buffer_len = tx.hdr.spi_responder.len() as u32;
+    return true;
+}
+
+#[derive(Debug, PartialEq)]
+struct DetectIkeChosenSa {
+    attribute: AttributeType,
+    value: DetectUintData<u32>,
+}
+
+fn ike_detect_chosen_sa_parse_aux(i: &str) -> Option<DetectIkeChosenSa> {
+    let (i, attribute) = map_opt(
+        take_while::<_, &str, nom8::error::Error<_>>(|c: char| c.is_alpha() || c == '_'),
+        |s: &str| AttributeType::from_str(s),
+    )
+    .parse(i)
+    .ok()?;
+    let (_i, value) = detect_parse_uint(i).ok()?;
+    Some(DetectIkeChosenSa { attribute, value })
+}
+
+unsafe fn ike_detect_chosen_sa_parse(
+    str: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_void {
+    let ft_name: &CStr = CStr::from_ptr(str); //unsafe
+    if let Ok(s) = ft_name.to_str() {
+        if let Some(ctx) = ike_detect_chosen_sa_parse_aux(s) {
+            let boxed = Box::new(ctx);
+            return Box::into_raw(boxed) as *mut _;
+        }
+    }
+    return std::ptr::null_mut();
+}
+
+unsafe extern "C" fn ike_detect_chosen_sa_setup(
+    de: *mut DetectEngineCtx, s: *mut Signature, raw: *const libc::c_char,
+) -> c_int {
+    if SCDetectSignatureSetAppProto(s, ALPROTO_IKE) != 0 {
+        return -1;
+    }
+    let ctx = ike_detect_chosen_sa_parse(raw);
+    if ctx.is_null() {
+        return -1;
+    }
+    if SCSigMatchAppendSMToList(
+        de,
+        s,
+        G_IKE_CHOSEN_SA_KW_ID,
+        ctx as *mut SigMatchCtx,
+        G_IKE_CHOSEN_SA_BUFFER_ID,
+    )
+    .is_null()
+    {
+        ike_detect_chosen_sa_free(std::ptr::null_mut(), ctx);
+        return -1;
+    }
+    return 0;
+}
+
+unsafe extern "C" fn ike_detect_chosen_sa_match(
+    _de: *mut DetectEngineThreadCtx, _f: *mut crate::flow::Flow, _flags: u8, _state: *mut c_void,
+    tx: *mut c_void, _sig: *const Signature, ctx: *const SigMatchCtx,
+) -> c_int {
+    let tx = cast_pointer!(tx, IKETransaction);
+    let ctx = cast_pointer!(ctx, DetectIkeChosenSa);
+
+    if tx.ike_version == 1 {
+        if !tx.hdr.ikev1_transforms.is_empty() {
+            // there should be only one chosen server_transform, check event
+            if let Some(server_transform) = tx.hdr.ikev1_transforms.first() {
+                for attr in server_transform {
+                    if attr.attribute_type == ctx.attribute {
+                        if let Some(numeric_value) = attr.numeric_value {
+                            if detect_match_uint(&ctx.value, numeric_value) {
+                                return 1;
+                            }
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+    } else if tx.ike_version == 2 {
+        for attr in tx.hdr.ikev2_transforms.iter() {
+            match attr {
+                IkeV2Transform::Encryption(e) if ctx.attribute == AttributeType::AlgEnc => {
+                    if detect_match_uint(&ctx.value, e.0.into()) {
+                        return 1;
+                    }
+                    return 0;
+                }
+                IkeV2Transform::Auth(e) if ctx.attribute == AttributeType::AlgAuth => {
+                    if detect_match_uint(&ctx.value, e.0.into()) {
+                        return 1;
+                    }
+                    return 0;
+                }
+                IkeV2Transform::PRF(ref e) if ctx.attribute == AttributeType::AlgPrf => {
+                    if detect_match_uint(&ctx.value, e.0.into()) {
+                        return 1;
+                    }
+                    return 0;
+                }
+                IkeV2Transform::DH(ref e) if ctx.attribute == AttributeType::AlgDh => {
+                    if detect_match_uint(&ctx.value, e.0.into()) {
+                        return 1;
+                    }
+                    return 0;
+                }
+                _ => (),
+            }
+        }
+    }
+
+    return 0;
+}
+
+unsafe extern "C" fn ike_detect_chosen_sa_free(_de: *mut DetectEngineCtx, ctx: *mut c_void) {
+    let ctx = cast_pointer!(ctx, DetectIkeChosenSa);
+    std::mem::drop(Box::from_raw(ctx));
+}
+
+unsafe extern "C" fn ike_detect_exchtype_setup(
+    de: *mut DetectEngineCtx, s: *mut Signature, raw: *const libc::c_char,
+) -> c_int {
+    if SCDetectSignatureSetAppProto(s, ALPROTO_IKE) != 0 {
+        return -1;
+    }
+    let ctx = SCDetectU8Parse(raw) as *mut c_void;
+    if ctx.is_null() {
+        return -1;
+    }
+    if SCSigMatchAppendSMToList(
+        de,
+        s,
+        G_IKE_EXCHTYPE_KW_ID,
+        ctx as *mut SigMatchCtx,
+        G_IKE_EXCHTYPE_BUFFER_ID,
+    )
+    .is_null()
+    {
+        ike_detect_exchtype_free(std::ptr::null_mut(), ctx);
+        return -1;
+    }
+    return 0;
+}
+
+unsafe extern "C" fn ike_detect_exchtype_match(
+    _de: *mut DetectEngineThreadCtx, _f: *mut crate::flow::Flow, _flags: u8, _state: *mut c_void,
+    tx: *mut c_void, _sig: *const Signature, ctx: *const SigMatchCtx,
+) -> c_int {
+    let tx = cast_pointer!(tx, IKETransaction);
+    let ctx = cast_pointer!(ctx, DetectUintData<u8>);
+    let mut exch_type: u8 = 0;
+    let found = if tx.ike_version == 1 {
+        if let Some(r) = tx.hdr.ikev1_header.exchange_type {
+            exch_type = r;
+            true
+        } else {
+            false
+        }
+    } else if tx.ike_version == 2 {
+        exch_type = tx.hdr.ikev2_header.exch_type.0;
+        true
+    } else {
+        false
+    };
+    if found && detect_match_uint(ctx, exch_type) {
+        return 1;
+    }
+    return 0;
+}
+
+unsafe extern "C" fn ike_detect_exchtype_free(_de: *mut DetectEngineCtx, ctx: *mut c_void) {
+    let ctx = cast_pointer!(ctx, DetectUintData<u8>);
+    SCDetectU8Free(ctx);
+}
+
+static mut G_IKE_NONCE_PAYLOAD_LENGTH_KW_ID: u16 = 0;
+static mut G_IKE_NONCE_PAYLOAD_LENGTH_BUFFER_ID: c_int = 0;
+
+unsafe extern "C" fn ike_detect_nonce_payload_length_setup(
+    de: *mut DetectEngineCtx, s: *mut Signature, raw: *const libc::c_char,
+) -> c_int {
+    if SCDetectSignatureSetAppProto(s, ALPROTO_IKE) != 0 {
+        return -1;
+    }
+    let ctx = SCDetectU32Parse(raw) as *mut c_void;
+    if ctx.is_null() {
+        return -1;
+    }
+    if SCSigMatchAppendSMToList(
+        de,
+        s,
+        G_IKE_NONCE_PAYLOAD_LENGTH_KW_ID,
+        ctx as *mut SigMatchCtx,
+        G_IKE_NONCE_PAYLOAD_LENGTH_BUFFER_ID,
+    )
+    .is_null()
+    {
+        ike_detect_nonce_payload_length_free(std::ptr::null_mut(), ctx);
+        return -1;
+    }
+    return 0;
+}
+
+unsafe extern "C" fn ike_detect_nonce_payload_length_match(
+    _de: *mut DetectEngineThreadCtx, _f: *mut crate::flow::Flow, _flags: u8, _state: *mut c_void,
+    tx: *mut c_void, _sig: *const Signature, ctx: *const SigMatchCtx,
+) -> c_int {
+    let tx = cast_pointer!(tx, IKETransaction);
+    let ctx = cast_pointer!(ctx, DetectUintData<u32>);
+    if tx.ike_version == 1
+        && !tx.hdr.ikev1_header.nonce.is_empty()
+        && detect_match_uint(ctx, tx.hdr.ikev1_header.nonce.len() as u32)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+unsafe extern "C" fn ike_detect_nonce_payload_length_free(
+    _de: *mut DetectEngineCtx, ctx: *mut c_void,
+) {
+    let ctx = cast_pointer!(ctx, DetectUintData<u32>);
+    SCDetectU32Free(ctx);
+}
+
+unsafe extern "C" fn ike_detect_payload_len_setup(
+    de: *mut DetectEngineCtx, s: *mut Signature, raw: *const libc::c_char,
+) -> c_int {
+    if SCDetectSignatureSetAppProto(s, ALPROTO_IKE) != 0 {
+        return -1;
+    }
+    let ctx = SCDetectU32Parse(raw) as *mut c_void;
+    if ctx.is_null() {
+        return -1;
+    }
+    if SCSigMatchAppendSMToList(
+        de,
+        s,
+        G_IKE_PAYLOAD_LEN_KW_ID,
+        ctx as *mut SigMatchCtx,
+        G_IKE_PAYLOAD_LEN_BUFFER_ID,
+    )
+    .is_null()
+    {
+        ike_detect_payload_len_free(std::ptr::null_mut(), ctx);
+        return -1;
+    }
+    return 0;
+}
+
+unsafe extern "C" fn ike_detect_payload_len_match(
+    _de: *mut DetectEngineThreadCtx, _f: *mut crate::flow::Flow, _flags: u8, _state: *mut c_void,
+    tx: *mut c_void, _sig: *const Signature, ctx: *const SigMatchCtx,
+) -> c_int {
+    let tx = cast_pointer!(tx, IKETransaction);
+    let ctx = cast_pointer!(ctx, DetectUintData<u32>);
+    if tx.ike_version == 1
+        && !tx.hdr.ikev1_header.key_exchange.is_empty()
+        && detect_match_uint(ctx, tx.hdr.ikev1_header.key_exchange.len() as u32)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+unsafe extern "C" fn ike_detect_payload_len_free(_de: *mut DetectEngineCtx, ctx: *mut c_void) {
+    let ctx = cast_pointer!(ctx, DetectUintData<u32>);
+    SCDetectU32Free(ctx);
+}
+
+unsafe extern "C" fn ike_nonce_payload_setup(
+    de_ctx: *mut DetectEngineCtx, s: *mut Signature, _str: *const c_char,
+) -> c_int {
+    if SCDetectBufferSetActiveList(de_ctx, s, G_IKE_NONCE_PAYLOAD_BUFFER_ID) < 0 {
+        return -1;
+    }
+    if SCDetectSignatureSetAppProto(s, ALPROTO_IKE) < 0 {
+        return -1;
+    }
+    return 0;
+}
+
+static mut G_IKE_SPI_INITIATOR_BUFFER_ID: c_int = 0;
+static mut G_IKE_SPI_RESPONDER_BUFFER_ID: c_int = 0;
+static mut G_IKE_KEY_EXCHANGE_BUFFER_ID: c_int = 0;
+static mut G_IKE_VENDOR_BUFFER_ID: c_int = 0;
+static mut G_IKE_EXCHTYPE_KW_ID: u16 = 0;
+static mut G_IKE_EXCHTYPE_BUFFER_ID: c_int = 0;
+static mut G_IKE_PAYLOAD_LEN_KW_ID: u16 = 0;
+static mut G_IKE_PAYLOAD_LEN_BUFFER_ID: c_int = 0;
+static mut G_IKE_NONCE_PAYLOAD_BUFFER_ID: c_int = 0;
+static mut G_IKE_CHOSEN_SA_KW_ID: u16 = 0;
+static mut G_IKE_CHOSEN_SA_BUFFER_ID: c_int = 0;
+
+#[no_mangle]
+pub unsafe extern "C" fn SCDetectIkeRegister() {
+    // Register sticky buffer for ike.nonce_payload
+    let kw_nonce = SigTableElmtStickyBuffer {
+        name: String::from("ike.nonce_payload"),
+        desc: String::from("sticky buffer to match on the IKE nonce_payload"),
+        url: String::from("/rules/ike-keywords.html#ike-nonce-payload"),
+        setup: ike_nonce_payload_setup,
+    };
+    helper_keyword_register_sticky_buffer(&kw_nonce);
+
+    // Register buffer for both directions
+    G_IKE_NONCE_PAYLOAD_BUFFER_ID = SCDetectHelperBufferMpmRegister(
+        b"ike.nonce_payload\0".as_ptr() as *const libc::c_char,
+        b"ike nonce payload\0".as_ptr() as *const libc::c_char,
+        ALPROTO_IKE,
+        STREAM_TOSERVER | STREAM_TOCLIENT,
+        Some(ike_get_nonce_data),
+    );
+    // Register ike.nonce_payload_length keyword
+    let kw = SCSigTableAppLiteElmt {
+        name: b"ike.nonce_payload_length\0".as_ptr() as *const libc::c_char,
+        desc: b"match IKE nonce payload length\0".as_ptr() as *const libc::c_char,
+        url: b"/rules/ike-keywords.html#ike-nonce-payload-length\0".as_ptr() as *const libc::c_char,
+        AppLayerTxMatch: Some(ike_detect_nonce_payload_length_match),
+        Setup: Some(ike_detect_nonce_payload_length_setup),
+        Free: Some(ike_detect_nonce_payload_length_free),
+        flags: SIGMATCH_INFO_UINT32,
+    };
+    G_IKE_NONCE_PAYLOAD_LENGTH_KW_ID = SCDetectHelperKeywordRegister(&kw);
+    G_IKE_NONCE_PAYLOAD_LENGTH_BUFFER_ID = SCDetectHelperBufferProgressRegister(
+        b"ike.nonce_payload_length\0".as_ptr() as *const libc::c_char,
+        ALPROTO_IKE,
+        STREAM_TOSERVER | STREAM_TOCLIENT,
+        1,
+    );
+    let kw = SCSigTableAppLiteElmt {
+        name: b"ike.exchtype\0".as_ptr() as *const libc::c_char,
+        desc: b"match IKE exchange type\0".as_ptr() as *const libc::c_char,
+        url: b"/rules/ike-keywords.html#ike-exchtype\0".as_ptr() as *const libc::c_char,
+        AppLayerTxMatch: Some(ike_detect_exchtype_match),
+        Setup: Some(ike_detect_exchtype_setup),
+        Free: Some(ike_detect_exchtype_free),
+        flags: SIGMATCH_INFO_UINT8,
+    };
+    G_IKE_EXCHTYPE_KW_ID = SCDetectHelperKeywordRegister(&kw);
+    G_IKE_EXCHTYPE_BUFFER_ID = SCDetectHelperBufferProgressRegister(
+        b"ike.exchtype\0".as_ptr() as *const libc::c_char,
+        ALPROTO_IKE,
+        STREAM_TOSERVER | STREAM_TOCLIENT,
+        1,
+    );
+    let kw = SCSigTableAppLiteElmt {
+        name: b"ike.chosen_sa_attribute\0".as_ptr() as *const libc::c_char,
+        desc: b"match IKE chosen SA Attribute\0".as_ptr() as *const libc::c_char,
+        url: b"/rules/ike-keywords.html#ike-chosen-sa-attribute\0".as_ptr() as *const libc::c_char,
+        AppLayerTxMatch: Some(ike_detect_chosen_sa_match),
+        Setup: Some(ike_detect_chosen_sa_setup),
+        Free: Some(ike_detect_chosen_sa_free),
+        flags: 0,
+    };
+    G_IKE_CHOSEN_SA_KW_ID = SCDetectHelperKeywordRegister(&kw);
+    G_IKE_CHOSEN_SA_BUFFER_ID = SCDetectHelperBufferProgressRegister(
+        b"ike.chosen_sa_attribute\0".as_ptr() as *const libc::c_char,
+        ALPROTO_IKE,
+        STREAM_TOCLIENT,
+        1,
+    );
+    let kw = SCSigTableAppLiteElmt {
+        name: b"ike.key_exchange_payload_length\0".as_ptr() as *const libc::c_char,
+        desc: b"match IKE key exchange payload length\0".as_ptr() as *const libc::c_char,
+        url: b"/rules/ike-keywords.html#ike-key-exchange-payload-length\0".as_ptr()
+            as *const libc::c_char,
+        AppLayerTxMatch: Some(ike_detect_payload_len_match),
+        Setup: Some(ike_detect_payload_len_setup),
+        Free: Some(ike_detect_payload_len_free),
+        flags: SIGMATCH_INFO_UINT32,
+    };
+    G_IKE_PAYLOAD_LEN_KW_ID = SCDetectHelperKeywordRegister(&kw);
+    G_IKE_PAYLOAD_LEN_BUFFER_ID = SCDetectHelperBufferProgressRegister(
+        b"ike.key_exchange_payload_length\0".as_ptr() as *const libc::c_char,
+        ALPROTO_IKE,
+        STREAM_TOSERVER | STREAM_TOCLIENT,
+        1,
+    );
+    let kw_initiator = SigTableElmtStickyBuffer {
+        name: String::from("ike.init_spi"),
+        desc: String::from("sticky buffer to match on the IKE spi initiator"),
+        url: String::from("/rules/ike-keywords.html#ike-init-spi-ike-resp-spi"),
+        setup: ike_spi_initiator_setup,
+    };
+    helper_keyword_register_sticky_buffer(&kw_initiator);
+    G_IKE_SPI_INITIATOR_BUFFER_ID = SCDetectHelperBufferMpmRegister(
+        b"ike_init_spi\0".as_ptr() as *const libc::c_char,
+        b"ike init spi\0".as_ptr() as *const libc::c_char,
+        ALPROTO_IKE,
+        STREAM_TOSERVER,
+        Some(ike_tx_get_spi_initiator),
+    );
+
+    let kw_responder = SigTableElmtStickyBuffer {
+        name: String::from("ike.resp_spi"),
+        desc: String::from("sticky buffer to match on the IKE spi responder"),
+        url: String::from("/rules/ike-keywords.html#ike-init-spi-ike-resp-spi"),
+        setup: ike_spi_responder_setup,
+    };
+    helper_keyword_register_sticky_buffer(&kw_responder);
+    G_IKE_SPI_RESPONDER_BUFFER_ID = SCDetectHelperBufferMpmRegister(
+        b"ike_resp_spi\0".as_ptr() as *const libc::c_char,
+        b"ike resp spi\0".as_ptr() as *const libc::c_char,
+        ALPROTO_IKE,
+        STREAM_TOCLIENT,
+        Some(ike_tx_get_spi_responder),
+    );
+
+    let kw = SigTableElmtStickyBuffer {
+        name: String::from("ike.key_exchange_payload"),
+        desc: String::from("sticky buffer to match on the IKE key_exchange_payload"),
+        url: String::from("/rules/ike-keywords.html#ike-key-exchange-payload"),
+        setup: ike_key_exchange_setup,
+    };
+    helper_keyword_register_sticky_buffer(&kw);
+    G_IKE_KEY_EXCHANGE_BUFFER_ID = SCDetectHelperBufferMpmRegister(
+        b"ike.key_exchange_payload\0".as_ptr() as *const libc::c_char,
+        b"ike key_exchange payload\0".as_ptr() as *const libc::c_char,
+        ALPROTO_IKE,
+        STREAM_TOSERVER | STREAM_TOCLIENT,
+        Some(ike_tx_get_key_exchange),
+    );
+    let kw = SigTableElmtStickyBuffer {
+        name: String::from("ike.vendor"),
+        desc: String::from("match IKE Vendor"),
+        url: String::from("/rules/ike-keywords.html#ike-vendor"),
+        setup: ike_vendor_setup,
+    };
+    helper_keyword_register_multi_buffer(&kw);
+    G_IKE_VENDOR_BUFFER_ID = SCDetectHelperMultiBufferMpmRegister(
+        b"ike.vendor.dn\0".as_ptr() as *const libc::c_char,
+        b"Like vendor\0".as_ptr() as *const libc::c_char,
+        ALPROTO_IKE,
+        STREAM_TOSERVER,
+        Some(ike_tx_get_vendor),
+    );
+}
+
+unsafe extern "C" fn ike_spi_initiator_setup(
+    de_ctx: *mut DetectEngineCtx, s: *mut Signature, _str: *const c_char,
+) -> c_int {
+    if SCDetectBufferSetActiveList(de_ctx, s, G_IKE_SPI_INITIATOR_BUFFER_ID) < 0 {
+        return -1;
+    }
+
+    if SCDetectSignatureSetAppProto(s, ALPROTO_IKE) < 0 {
+        return -1;
+    }
+
+    return 0;
+}
+
+unsafe extern "C" fn ike_spi_responder_setup(
+    de_ctx: *mut DetectEngineCtx, s: *mut Signature, _str: *const c_char,
+) -> c_int {
+    if SCDetectBufferSetActiveList(de_ctx, s, G_IKE_SPI_RESPONDER_BUFFER_ID) < 0 {
+        return -1;
+    }
+
+    if SCDetectSignatureSetAppProto(s, ALPROTO_IKE) < 0 {
+        return -1;
+    }
+
+    return 0;
+}
+
+unsafe extern "C" fn ike_key_exchange_setup(
+    de_ctx: *mut DetectEngineCtx, s: *mut Signature, _str: *const c_char,
+) -> c_int {
+    if SCDetectBufferSetActiveList(de_ctx, s, G_IKE_KEY_EXCHANGE_BUFFER_ID) < 0 {
+        return -1;
+    }
+    if SCDetectSignatureSetAppProto(s, ALPROTO_IKE) < 0 {
+        return -1;
+    }
+    return 0;
+}
+
+unsafe extern "C" fn ike_vendor_setup(
+    de_ctx: *mut DetectEngineCtx, s: *mut Signature, _str: *const c_char,
+) -> c_int {
+    if SCDetectBufferSetActiveList(de_ctx, s, G_IKE_VENDOR_BUFFER_ID) < 0 {
+        return -1;
+    }
+    if SCDetectSignatureSetAppProto(s, ALPROTO_IKE) < 0 {
+        return -1;
+    }
+    return 0;
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use crate::detect::uint::DetectUintMode;
+
+    #[test]
+    fn test_ike_detect_chosen_sa_parse_aux() {
+        let r0 = ike_detect_chosen_sa_parse_aux("alg_hash=2").unwrap();
+        assert_eq!(
+            r0,
+            DetectIkeChosenSa {
+                attribute: AttributeType::AlgHash,
+                value: DetectUintData::<u32> {
+                    mode: DetectUintMode::DetectUintModeEqual,
+                    arg1: 2,
+                    arg2: 0,
+                },
+            }
+        );
+        let r1 = ike_detect_chosen_sa_parse_aux("alg_hash!=2").unwrap();
+        assert_eq!(
+            r1,
+            DetectIkeChosenSa {
+                attribute: AttributeType::AlgHash,
+                value: DetectUintData::<u32> {
+                    mode: DetectUintMode::DetectUintModeNe,
+                    arg1: 2,
+                    arg2: 0,
+                },
+            }
+        );
+    }
+}
